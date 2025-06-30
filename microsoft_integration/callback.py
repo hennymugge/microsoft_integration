@@ -95,36 +95,49 @@ def exchange_code_for_token(code: str, provider: "frappe.Document") -> dict:
 
 def get_decoded_and_verified_token(token: str, provider: "frappe.Document") -> dict:
     """
-    Decodes the JWT ID token and verifies its signature against Microsoft's public keys.
-    This is the upgraded, secure implementation.
+    Decodes the JWT ID token and verifies its signature.
+    This version is fully dynamic and requires no extra configuration.
+    It fetches the expected issuer from Microsoft's OIDC metadata endpoint.
     """
-    # URL to fetch Microsoft's public signing keys (JWKS). Make it configurable.
-    jwks_url = frappe.get_conf().get(
-        "microsoft_jwks_url",
-        "https://login.microsoftonline.com/common/discovery/v2.0/keys",
-    )
-    
-    # The PyJWKClient handles fetching, caching, and selecting the correct public key.
-    jwks_client = PyJWKClient(jwks_url)
-    
+    import requests
+
+    # 1. Construct the OIDC metadata URL from the provider's Base URL
+    #    e.g., https://login.microsoftonline.com/{tenant}/ -> https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration
+    #    The v2.0 endpoint is standard for modern auth.
+    base_url = provider.base_url.rstrip("/")
+    metadata_url = f"{base_url}/v2.0/.well-known/openid-configuration"
+
     try:
-        # This one line replaces the entire old manual key lookup loop.
+        # 2. Fetch the metadata and extract the expected issuer and jwks_uri
+        metadata_response = requests.get(metadata_url, timeout=5)
+        metadata_response.raise_for_status()
+        oidc_metadata = metadata_response.json()
+        
+        expected_issuer = oidc_metadata.get("issuer")
+        jwks_uri = oidc_metadata.get("jwks_uri")
+
+        if not expected_issuer or not jwks_uri:
+            raise ValueError("Issuer or JWKS URI not found in OIDC metadata.")
+
+    except (requests.exceptions.RequestException, ValueError) as e:
+        frappe.log_error(f"Failed to fetch or parse OIDC metadata from {metadata_url}: {e}")
+        frappe.throw(_("Could not retrieve authentication provider's configuration. Please contact administrator."))
+
+    # 3. Use the dynamically fetched jwks_uri to get the signing key
+    jwks_client = PyJWKClient(jwks_uri)
+    try:
         signing_key = jwks_client.get_signing_key_from_jwt(token)
     except jwt.exceptions.PyJWKClientError as e:
-        frappe.log_error(f"Failed to get signing key from JWKS endpoint: {e}")
+        frappe.log_error(f"Failed to get signing key from JWKS endpoint {jwks_uri}: {e}")
         raise
 
-    # Now decode the token. This function will automatically:
-    # 1. Verify the signature using the `signing_key`.
-    # 2. Verify the 'exp' (expiration) and 'nbf' (not before) claims.
-    # 3. Verify the 'aud' (audience) claim matches our client_id.
-    # 4. Verify the 'iss' (issuer) claim matches the provider's base_url.
+    # 4. Decode the token, validating against the dynamically fetched issuer
     decoded_token = jwt.decode(
         token,
         key=signing_key.key,
         algorithms=["RS256"],
         audience=provider.client_id,
-        issuer=provider.base_url,
+        issuer=expected_issuer,
     )
-    
+
     return decoded_token
