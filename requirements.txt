@@ -1,2 +1,2 @@
 # frappe -- https://github.com/frappe/frappe is installed via 'bench init'
-PyJWT==2.0.0
+PyJWT==2.10.1
