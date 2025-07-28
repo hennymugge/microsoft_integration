@@ -93,8 +93,6 @@ def _assign_frappe_roles(user_email: str, entra_app_roles: list):
         default_role = frappe.db.get_single_value("Microsoft Integration Settings", "default_sso_role")
         if default_role and not roles_to_assign:
             roles_to_assign.append(default_role)
-            # ### FIXED TYPO HERE ###
-            frappe.log_message(f"User {user_email} has no specific Entra roles, will assign default: '{default_role}'")
 
         all_managed_roles = frappe.get_all("Frappe Role Entra Role", pluck="frappe_role", distinct=True)
         if default_role and default_role not in all_managed_roles:
@@ -116,8 +114,6 @@ def _assign_frappe_roles(user_email: str, entra_app_roles: list):
 
         if needs_save:
             user.save(ignore_permissions=True)
-            # ### FIXED TYPO HERE ###
-            frappe.log_message(f"Updated Frappe Roles for {user_email}. Added: {roles_to_add}, Removed: {roles_to_remove}")
             frappe.db.commit()
 
     except Exception:
@@ -148,8 +144,6 @@ def _enroll_in_programs(user_email: str, entra_groups: list):
                 enrollment.program = program
                 enrollment.enrollment_date = nowdate()
                 enrollment.insert(ignore_permissions=True)
-                # ### FIXED TYPO HERE ###
-                frappe.log_message(f"Enrolled user {user_email} in program '{program}'.")
         
         frappe.db.commit()
     except Exception:
