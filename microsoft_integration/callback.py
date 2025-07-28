@@ -1,3 +1,4 @@
+// callback.py
 import base64
 import json
 
@@ -14,7 +15,8 @@ from jwt import PyJWKClient
 def azure_ad_b2c(*args, **kwargs):
     """
     Handles the OAuth2 callback from Azure AD.
-    This function is now upgraded to use modern, secure JWT validation.
+    This function is now upgraded to use modern, secure JWT validation and
+    assign LMS Programs based on Entra ID group membership.
     """
     try:
         # 1. Decode the state parameter sent back by Azure
@@ -27,8 +29,6 @@ def azure_ad_b2c(*args, **kwargs):
             frappe.throw(_("CSRF Token missing from state."), title=_("Invalid Request"))
 
         # 2. Get the Social Login Key configuration from Frappe
-        # The name "azure_ad_b2c" is derived from the "Provider Name" field in the doctype.
-        # Frappe converts "Azure AD B2C" to "azure_ad_b2c".
         provider_name = frappe.get_conf().get("azure_provider_key", "azure_ad_b2c")
         provider = frappe.get_doc("Social Login Key", provider_name)
 
@@ -48,13 +48,28 @@ def azure_ad_b2c(*args, **kwargs):
         decoded_id_token = get_decoded_and_verified_token(id_token, provider)
 
         # 5. Prepare user info and log the user in
-        # Handle cases where email might be in 'preferred_username' or 'upn'
         if not decoded_id_token.get("email"):
             email = decoded_id_token.get("preferred_username") or decoded_id_token.get("upn")
             if email:
                 decoded_id_token["email"] = email
 
         login_oauth_user(decoded_id_token, provider=provider.name, state=state)
+
+        # --- NEW: LMS Program Assignment Logic ---
+        # After successful login, assign LMS programs based on Entra ID groups.
+        # This requires group claims to be configured in the Entra ID app registration.
+        # The claim is typically named "groups".
+        try:
+            user_groups = decoded_id_token.get("groups", [])
+            if user_groups:
+                _assign_programs_from_entra_groups(frappe.session.user, user_groups)
+        except Exception:
+            # Log the error but do not block the user's login.
+            frappe.log_error(
+                frappe.get_traceback(),
+                "Failed during LMS Program assignment post-login"
+            )
+        # --- END NEW LOGIC ---
 
     except jwt.exceptions.PyJWTError as e:
         frappe.log_error(f"JWT Validation Failed: {e}", "Azure AD Login")
@@ -101,14 +116,10 @@ def get_decoded_and_verified_token(token: str, provider: "frappe.Document") -> d
     """
     import requests
 
-    # 1. Construct the OIDC metadata URL from the provider's Base URL
-    #    e.g., https://login.microsoftonline.com/{tenant}/ -> https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration
-    #    The v2.0 endpoint is standard for modern auth.
     base_url = provider.base_url.rstrip("/")
     metadata_url = f"{base_url}/v2.0/.well-known/openid-configuration"
 
     try:
-        # 2. Fetch the metadata and extract the expected issuer and jwks_uri
         metadata_response = requests.get(metadata_url, timeout=5)
         metadata_response.raise_for_status()
         oidc_metadata = metadata_response.json()
@@ -123,7 +134,6 @@ def get_decoded_and_verified_token(token: str, provider: "frappe.Document") -> d
         frappe.log_error(f"Failed to fetch or parse OIDC metadata from {metadata_url}: {e}")
         frappe.throw(_("Could not retrieve authentication provider's configuration. Please contact administrator."))
 
-    # 3. Use the dynamically fetched jwks_uri to get the signing key
     jwks_client = PyJWKClient(jwks_uri)
     try:
         signing_key = jwks_client.get_signing_key_from_jwt(token)
@@ -131,7 +141,6 @@ def get_decoded_and_verified_token(token: str, provider: "frappe.Document") -> d
         frappe.log_error(f"Failed to get signing key from JWKS endpoint {jwks_uri}: {e}")
         raise
 
-    # 4. Decode the token, validating against the dynamically fetched issuer
     decoded_token = jwt.decode(
         token,
         key=signing_key.key,
@@ -141,3 +150,64 @@ def get_decoded_and_verified_token(token: str, provider: "frappe.Document") -> d
     )
 
     return decoded_token
+
+
+def _assign_programs_from_entra_groups(user_email: str, entra_group_ids: list):
+    """
+    Assigns LMS Programs to a user based on their Entra ID group memberships.
+
+    This function requires a custom DocType named 'LMS Program Entra Group'
+    with the following fields:
+    - 'lms_program' (Link to LMS Program)
+    - 'entra_group_id' (Data, Unique)
+    """
+    if not frappe.db.exists("DocType", "LMS Program"):
+        frappe.log_error("Frappe LMS is not installed. Skipping program assignment.")
+        return
+
+    if not frappe.db.exists("DocType", "LMS Program Entra Group"):
+        frappe.log_error(
+            title="Entra SSO Program Sync Failed",
+            message="DocType 'LMS Program Entra Group' not found. Please create it to enable auto-assignment."
+        )
+        return
+
+    try:
+        # 1. Find all LMS Programs that are mapped to the user's Entra groups
+        program_mappings = frappe.get_all(
+            "LMS Program Entra Group",
+            filters={"entra_group_id": ("in", entra_group_ids)},
+            fields=["lms_program"],
+            pluck="lms_program",
+            distinct=True
+        )
+
+        if not program_mappings:
+            frappe.log_info(
+                f"User {user_email} belongs to Entra groups, but no matching Program mappings were found.",
+                "Entra SSO Program Sync"
+            )
+            return
+
+        # 2. For each matched program, enroll the user if they aren't already
+        for program_name in program_mappings:
+            is_enrolled = frappe.db.exists(
+                "Program Enrollment", {"student": user_email, "program": program_name}
+            )
+
+            if not is_enrolled:
+                enrollment_doc = frappe.new_doc("Program Enrollment")
+                enrollment_doc.student = user_email
+                enrollment_doc.program = program_name
+                enrollment_doc.insert(ignore_permissions=True, ignore_mandatory=True)
+                frappe.log_info(
+                    f"Enrolled user {user_email} in program '{program_name}'.",
+                    "Entra SSO Program Sync"
+                )
+
+        frappe.db.commit()
+
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), "LMS Program Auto-Assignment Failed")
+        # Do not re-throw the exception, as it would fail the login process.
