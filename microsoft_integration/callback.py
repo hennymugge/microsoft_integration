@@ -59,9 +59,9 @@ def azure_ad_b2c(*args, **kwargs):
         # This requires group claims to be configured in the Entra ID app registration.
         # The claim is typically named "groups".
         try:
-            user_groups = decoded_id_token.get("groups", [])
-            if user_groups:
-                _assign_programs_from_entra_groups(frappe.session.user, user_groups)
+            user_roles = decoded_id_token.get("roles", [])
+            if user_roles:
+                _assign_programs_from_entra_groups(frappe.session.user, user_roles)
         except Exception:
             # Log the error but do not block the user's login.
             frappe.log_error(
