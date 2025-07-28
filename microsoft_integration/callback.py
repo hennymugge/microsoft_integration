@@ -138,11 +138,20 @@ def _enroll_in_programs(user_email: str, entra_groups: list):
         )
 
         for program in programs_to_enroll:
-            if not frappe.db.exists("Program Enrollment", {"student": user_email, "program": program}):
-                enrollment = frappe.new_doc("Program Enrollment")
-                enrollment.student = user_email
+            # Check if the user is already a member of the program
+            if not frappe.db.exists("LMS Program Member", {"member": user_email, "program": program}):
+                
+                # Create a new doc of the correct type
+                enrollment = frappe.new_doc("LMS Program Member")
+                
+                # Use the correct field names
+                enrollment.member = user_email # Assuming the field is 'member' for the user
                 enrollment.program = program
-                enrollment.enrollment_date = nowdate()
+                
+                # The enrollment_date might not be a field on this DocType, so we make it robust
+                if enrollment.has_field("enrollment_date"):
+                    enrollment.enrollment_date = nowdate()
+                
                 enrollment.insert(ignore_permissions=True)
         
         frappe.db.commit()
