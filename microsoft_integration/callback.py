@@ -4,6 +4,7 @@ import json
 import frappe
 import jwt
 from frappe import _
+from frappe.utils import nowdate  # ### NEW: Import nowdate for setting enrollment date
 from frappe.utils.oauth import login_oauth_user
 from jwt import PyJWKClient
 
@@ -15,7 +16,7 @@ def azure_ad_b2c(*args, **kwargs):
     """
     Handles the OAuth2 callback from Azure AD.
     This function is now upgraded to use modern, secure JWT validation and
-    assign LMS Programs based on Entra ID group membership.
+    assign LMS Programs based on Entra ID App Roles or Groups.
     """
     try:
         # 1. Decode the state parameter sent back by Azure
@@ -54,21 +55,32 @@ def azure_ad_b2c(*args, **kwargs):
 
         login_oauth_user(decoded_id_token, provider=provider.name, state=state)
 
-        # --- NEW: LMS Program Assignment Logic ---
-        # After successful login, assign LMS programs based on Entra ID groups.
-        # This requires group claims to be configured in the Entra ID app registration.
-        # The claim is typically named "groups".
+        # --- MODIFIED: LMS Program Assignment & Debugging Logic ---
         try:
+            # ### NEW: Robust check for roles and groups with clear logging ###
             user_roles = decoded_id_token.get("roles", [])
-            if user_roles:
-                _assign_programs_from_entra_groups(frappe.session.user, user_roles)
+            user_groups = decoded_id_token.get("groups", [])
+
+            # This log is CRUCIAL for debugging. It will appear in the Error Log UI.
+            frappe.log_error(
+                title="Entra SSO Token Debug",
+                message=f"User {frappe.session.user} logged in. Roles: {user_roles}. Groups: {user_groups}"
+            )
+
+            # Prefer App Roles, but fall back to Security Groups if roles are not present.
+            ids_to_check = user_roles or user_groups
+
+            if ids_to_check:
+                # Use a more generic function name for clarity
+                _assign_programs_from_claims(frappe.session.user, ids_to_check)
+
         except Exception:
             # Log the error but do not block the user's login.
             frappe.log_error(
                 frappe.get_traceback(),
                 "Failed during LMS Program assignment post-login"
             )
-        # --- END NEW LOGIC ---
+        # --- END MODIFIED LOGIC ---
 
     except jwt.exceptions.PyJWTError as e:
         frappe.log_error(f"JWT Validation Failed: {e}", "Azure AD Login")
@@ -103,7 +115,7 @@ def exchange_code_for_token(code: str, provider: "frappe.Document") -> dict:
     token_url = provider.base_url + provider.access_token_url
     
     response = requests.post(url=token_url, data=data)
-    response.raise_for_status()  # Will raise an exception for 4xx/5xx errors
+    response.raise_for_status()
     return response.json()
 
 
@@ -111,7 +123,6 @@ def get_decoded_and_verified_token(token: str, provider: "frappe.Document") -> d
     """
     Decodes the JWT ID token and verifies its signature.
     This version is fully dynamic and requires no extra configuration.
-    It fetches the expected issuer from Microsoft's OIDC metadata endpoint.
     """
     import requests
 
@@ -151,14 +162,13 @@ def get_decoded_and_verified_token(token: str, provider: "frappe.Document") -> d
     return decoded_token
 
 
-def _assign_programs_from_entra_groups(user_email: str, entra_group_ids: list):
+# ### MODIFIED: Renamed function and parameter for clarity ###
+def _assign_programs_from_claims(user_email: str, claim_ids: list):
     """
-    Assigns LMS Programs to a user based on their Entra ID group memberships.
+    Assigns LMS Programs to a user based on their Entra ID App Roles or Group memberships.
 
     This function requires a custom DocType named 'LMS Program Entra Group'
-    with the following fields:
-    - 'lms_program' (Link to LMS Program)
-    - 'entra_group_id' (Data, Unique)
+    with 'lms_program' and 'entra_group_id' fields.
     """
     if not frappe.db.exists("DocType", "LMS Program"):
         frappe.log_error("Frappe LMS is not installed. Skipping program assignment.")
@@ -172,10 +182,10 @@ def _assign_programs_from_entra_groups(user_email: str, entra_group_ids: list):
         return
 
     try:
-        # 1. Find all LMS Programs that are mapped to the user's Entra groups
+        # Find all LMS Programs mapped to the user's claims
         program_mappings = frappe.get_all(
             "LMS Program Entra Group",
-            filters={"entra_group_id": ("in", entra_group_ids)},
+            filters={"entra_group_id": ("in", claim_ids)},
             fields=["lms_program"],
             pluck="lms_program",
             distinct=True
@@ -183,22 +193,20 @@ def _assign_programs_from_entra_groups(user_email: str, entra_group_ids: list):
 
         if not program_mappings:
             frappe.log_info(
-                f"User {user_email} belongs to Entra groups, but no matching Program mappings were found.",
+                f"User {user_email} has claims {claim_ids}, but no matching Program mappings were found.",
                 "Entra SSO Program Sync"
             )
             return
 
-        # 2. For each matched program, enroll the user if they aren't already
+        # Enroll the user in each matched program if they aren't already
         for program_name in program_mappings:
-            is_enrolled = frappe.db.exists(
-                "Program Enrollment", {"student": user_email, "program": program_name}
-            )
-
-            if not is_enrolled:
+            if not frappe.db.exists("Program Enrollment", {"student": user_email, "program": program_name}):
                 enrollment_doc = frappe.new_doc("Program Enrollment")
                 enrollment_doc.student = user_email
                 enrollment_doc.program = program_name
-                enrollment_doc.insert(ignore_permissions=True, ignore_mandatory=True)
+                # ### NEW: Set mandatory enrollment date for safer insert ###
+                enrollment_doc.enrollment_date = nowdate()
+                enrollment_doc.insert(ignore_permissions=True) # ignore_mandatory is no longer needed
                 frappe.log_info(
                     f"Enrolled user {user_email} in program '{program_name}'.",
                     "Entra SSO Program Sync"
@@ -209,4 +217,3 @@ def _assign_programs_from_entra_groups(user_email: str, entra_group_ids: list):
     except Exception:
         frappe.db.rollback()
         frappe.log_error(frappe.get_traceback(), "LMS Program Auto-Assignment Failed")
-        # Do not re-throw the exception, as it would fail the login process.
